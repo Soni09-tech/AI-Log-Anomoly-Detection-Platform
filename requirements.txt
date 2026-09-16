@@ -1,0 +1,17 @@
+# Core pipeline (works offline, used to build/test this project)
+pandas
+numpy
+scikit-learn
+joblib
+
+# API + dashboard runtime
+fastapi
+uvicorn
+python-multipart
+requests
+streamlit
+
+# Optional upgrades (install once you have internet access)
+drain3          # production-grade log parser, swap in for log_parser.py
+torch           # for lstm_autoencoder.py (sequence model)
+plotly          # nicer charts in the dashboard (optional)

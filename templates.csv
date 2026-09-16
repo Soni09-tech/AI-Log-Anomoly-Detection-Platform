@@ -1,0 +1,12 @@
+event_id,template
+0,PacketResponder <NUM> for block <BLK> Interrupted
+1,Verification succeeded for <BLK>
+2,PacketResponder <NUM> for block <BLK> terminating
+3,BLOCK* NameSystem.addStoredBlock: blockMap updated: <IP> is added to <BLK> size <NUM>
+4,Receiving block <BLK> src: /<IP> dest: /<IP>
+5,Exception in receiveBlock for block <BLK> java.io.IOException: Connection reset by peer
+6,BLOCK* ask <IP> to delete <BLK>
+7,Received block <BLK> of size <NUM> from /<IP>
+8,BLOCK* NameSystem.delete: <BLK> is added to invalidSet of <IP>
+9,BLOCK* NameSystem.addStoredBlock: Redundant addStoredBlock request received for <BLK>
+10,WARN dfs.DataNode: writeBlock <BLK> received exception java.net.SocketTimeoutException
