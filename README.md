@@ -1,115 +1,330 @@
-# AI Log Anomaly Detection Platform
+# 🚀 AI Log Anomaly Detection Platform
 
-Detects anomalous system/application log sessions using ML — a count-based
-unsupervised baseline (Isolation Forest) and an optional sequence-based
-deep learning model (LSTM Autoencoder), with a Streamlit dashboard for
-inspection.
+Detect anomalous system and application log sessions using Machine Learning. This project combines an unsupervised anomaly detection baseline (**Isolation Forest**) with an optional sequence-aware deep learning model (**LSTM Autoencoder**) and provides a **Streamlit dashboard** for interactive analysis.
 
-## How it works
+## 🌐 Live Demo
 
-```
+**Streamlit App:**
+https://ai-log-anomoly-detection-platform-kd6zpsyshzngbyx3by8jtg.streamlit.app/
+
+---
+
+## 📌 Overview
+
+Large-scale systems generate massive volumes of logs every day. Identifying abnormal behavior manually is difficult, time-consuming, and error-prone.
+
+This platform automates the process by:
+
+* Parsing raw logs into structured event templates
+* Extracting session-level features
+* Detecting anomalies using Machine Learning
+* Visualizing results through an interactive dashboard
+
+---
+
+## 🏗️ Architecture
+
+```text
 raw_logs.log ──► log_parser.py ──► parsed_logs.csv (event templates)
                                           │
                                           ▼
                                    features.py ──► features.csv
-                                          │           (one row per session:
-                                          │            event counts + stats)
+                                          │
                                           ▼
                           train_isolation_forest.py ──► results + model
-                          lstm_autoencoder.py (optional, sequence-aware)
+                          lstm_autoencoder.py (optional)
                                           │
                                           ▼
                               app/dashboard.py (Streamlit UI)
 ```
 
-**1. Log parsing (`src/log_parser.py`)** — masks variable tokens
-(numbers, IPs, block IDs) in each log line so structurally identical
-lines collapse into the same "event template," the way Drain/Drain3
-works. Ships a dependency-free implementation so the whole pipeline runs
-without internet access; swap in the real `drain3` package for
-production use (see comments in the file).
+---
 
-**2. Feature engineering (`src/features.py`)** — groups log lines by
-session (block ID) and builds one feature vector per session: how many
-times each event template occurred, sequence length, distinct event
-count, and WARN/ERROR ratio. Splits chronologically (not randomly) to
-avoid leaking future sessions into training.
+## 📂 Project Structure
 
-**3. Baseline model (`src/train_isolation_forest.py`)** — Isolation
-Forest, unsupervised, trained on the count vectors. Reports
-precision/recall/F1/ROC-AUC (not accuracy — anomalies are rare, so
-accuracy is a misleading metric here).
+```text
+AI-Log-Anomoly-Detection-Platform/
+│
+├── app/
+│   └── dashboard.py
+│
+├── data/
+│   ├── generate_logs.py
+│   ├── raw_logs.log
+│   └── labels.csv
+│
+├── src/
+│   ├── log_parser.py
+│   ├── features.py
+│   ├── train_isolation_forest.py
+│   └── lstm_autoencoder.py
+│
+├── models/
+├── outputs/
+├── requirements.txt
+└── README.md
+```
 
-**4. Sequence model (`src/lstm_autoencoder.py`, optional)** — an LSTM
-Autoencoder trained only on normal sessions; it learns to reconstruct
-normal event sequences, and sessions with high reconstruction error are
-flagged as anomalous. This is the natural "level up" for your report:
-count-based vs. order-aware detection. Requires `torch`.
+---
 
-**5. Dashboard (`app/dashboard.py`, optional)** — Streamlit app showing
-flagged sessions, anomaly score distribution, and a drill-down view into
-each session's raw events. Requires `streamlit`.
+## ⚙️ Features
 
-## Setup
+### 1. Log Parsing
+
+`src/log_parser.py`
+
+* Converts raw logs into event templates
+* Masks variable values such as:
+
+  * Numbers
+  * IP Addresses
+  * Block IDs
+* Groups structurally similar log messages
+
+Output:
+
+```text
+parsed_logs.csv
+```
+
+---
+
+### 2. Feature Engineering
+
+`src/features.py`
+
+Creates one feature vector per session containing:
+
+* Event template counts
+* Sequence length
+* Number of distinct events
+* WARN ratio
+* ERROR ratio
+
+Uses chronological splitting to prevent future-data leakage.
+
+Output:
+
+```text
+features.csv
+```
+
+---
+
+### 3. Isolation Forest (Baseline Model)
+
+`src/train_isolation_forest.py`
+
+An unsupervised anomaly detection algorithm trained on session-level feature vectors.
+
+Evaluation Metrics:
+
+* Precision
+* Recall
+* F1 Score
+* ROC-AUC
+
+---
+
+### 4. LSTM Autoencoder (Optional)
+
+`src/lstm_autoencoder.py`
+
+A sequence-aware deep learning model that:
+
+1. Learns normal event sequences
+2. Reconstructs log sequences
+3. Calculates reconstruction error
+4. Flags high-error sessions as anomalous
+
+Advantages:
+
+* Captures event order
+* Learns temporal dependencies
+* Detects complex anomalies
+
+Requires:
+
+```bash
+pip install torch
+```
+
+---
+
+### 5. Streamlit Dashboard
+
+`app/dashboard.py`
+
+Interactive dashboard for:
+
+* Viewing detected anomalies
+* Exploring anomaly score distributions
+* Investigating individual sessions
+* Reviewing raw log events
+
+Launch:
+
+```bash
+streamlit run app/dashboard.py
+```
+
+---
+
+## 🛠️ Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Soni09-tech/AI-Log-Anomoly-Detection-Platform.git
+cd AI-Log-Anomoly-Detection-Platform
+```
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Everything in `pandas`/`numpy`/`scikit-learn` works offline. `drain3`,
-`torch`, and `streamlit` are optional upgrades — install them once you
-have internet access.
+---
 
-## Run the pipeline
+## ▶️ Running the Pipeline
+
+### Generate Synthetic Logs
 
 ```bash
-python data/generate_logs.py          # synthetic HDFS-style logs + labels
-python src/log_parser.py              # raw logs -> event templates
-python src/features.py                # event templates -> feature vectors
-python src/train_isolation_forest.py  # train + evaluate baseline model
-
-# optional
-python src/lstm_autoencoder.py        # train + evaluate sequence model
-streamlit run app/dashboard.py        # launch dashboard
+python data/generate_logs.py
 ```
 
-## Swapping in a real dataset
+### Parse Logs
 
-Replace `data/generate_logs.py`'s output with a real dataset from
-[Loghub](https://github.com/logpai/loghub) (HDFS and BGL both ship
-ground-truth anomaly labels per block/session). Keep the same file
-layout:
-- `data/raw_logs.log` — raw log lines
-- `data/labels.csv` — columns `block_id,label` (1 = anomalous)
+```bash
+python src/log_parser.py
+```
 
-Everything downstream (`log_parser.py` onward) works unchanged, since
-Loghub's HDFS format matches the `date time pid level component: content`
-layout this parser expects. For other datasets (BGL, Linux, Hadoop),
-you'll need to adjust `LOG_LINE_RE` in `log_parser.py` to match their
-line format.
+### Generate Features
 
-## Results on the synthetic dataset (Isolation Forest baseline)
+```bash
+python src/features.py
+```
 
-| Metric | Score |
-|---|---|
-| Precision | 0.90 |
-| Recall | 0.97 |
-| F1 | 0.94 |
-| ROC-AUC | 0.98 |
+### Train Isolation Forest
 
-(Synthetic anomalies are somewhat easier to separate than real-world
-ones — expect these numbers to drop, especially recall, on a real
-dataset like Loghub HDFS. Report both.)
+```bash
+python src/train_isolation_forest.py
+```
 
-## Suggested next steps for your report
+### Train LSTM Autoencoder (Optional)
 
-- Compare Isolation Forest vs. LSTM Autoencoder head-to-head on the same
-  test split — this comparison alone is a strong "results" section.
-- Try One-Class SVM as a second baseline.
-- Add a live "streaming" simulation: replay `raw_logs.log` line-by-line
-  with a delay, feeding a rolling window into the model, to demo
-  near-real-time detection.
-- If you want a DeepLog-style approach instead of an autoencoder: train
-  an LSTM to predict the *next* event given the previous k events;
-  flag a session anomalous if the actual next event isn't in the
-  model's top-k predicted events.
+```bash
+python src/lstm_autoencoder.py
+```
+
+### Launch Dashboard
+
+```bash
+streamlit run app/dashboard.py
+```
+
+---
+
+## 📊 Results
+
+### Isolation Forest Performance (Synthetic Dataset)
+
+| Metric    | Score |
+| --------- | ----- |
+| Precision | 0.90  |
+| Recall    | 0.97  |
+| F1 Score  | 0.94  |
+| ROC-AUC   | 0.98  |
+
+> Note: Synthetic datasets are easier than real-world logs. Performance may decrease when evaluated on production datasets.
+
+---
+
+## 🔄 Using Real Datasets
+
+You can replace the synthetic dataset with datasets from:
+
+* HDFS
+* BGL
+* Linux Logs
+* Hadoop Logs
+
+Recommended source:
+
+**Loghub Dataset Repository**
+
+https://github.com/logpai/loghub
+
+Required files:
+
+```text
+data/raw_logs.log
+data/labels.csv
+```
+
+Example labels format:
+
+```csv
+block_id,label
+blk_123,0
+blk_456,1
+```
+
+Where:
+
+* 0 = Normal
+* 1 = Anomalous
+
+---
+
+## 🚀 Future Improvements
+
+* Compare Isolation Forest vs LSTM Autoencoder
+* Add One-Class SVM baseline
+* Real-time log streaming detection
+* REST API integration
+* Docker deployment
+* Kubernetes deployment
+* Alerting and monitoring system
+
+---
+
+## 🧰 Technology Stack
+
+* Python
+* Pandas
+* NumPy
+* Scikit-learn
+* PyTorch
+* Streamlit
+
+---
+
+## 🎯 Use Cases
+
+* Infrastructure Monitoring
+* Distributed Systems
+* Cloud Platforms
+* Security Monitoring
+* Application Performance Analysis
+* IT Operations Analytics
+
+---
+
+## 👨‍💻 Author
+
+**Soni Kumar**
+
+GitHub Repository:
+https://github.com/Soni09-tech/AI-Log-Anomoly-Detection-Platform
+
+Live Demo:
+https://ai-log-anomoly-detection-platform-kd6zpsyshzngbyx3by8jtg.streamlit.app/
+
+---
+
+## ⭐ Support
+
+If you found this project useful, consider giving the repository a star on GitHub.
