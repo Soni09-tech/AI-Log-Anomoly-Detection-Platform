@@ -1,211 +1,257 @@
 from __future__ import annotations
 
 import logging
-import re
 import tempfile
-import uuid
-from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import joblib
-import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException
+from starlette.requests import ClientDisconnect
 
-from features import build_feature_matrix
-from log_parser import parse_log_file
+from streaming_inference import analyze_log_path
 
-ROOT = Path(__file__).resolve().parents[1]
-MODEL_PATH = ROOT / "isolation_forest.joblib"
-TEMP_DIR = ROOT / "tmp_uploads"
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
-SUPPORTED_SUFFIXES = {".log", ".txt"}
-logger = logging.getLogger("ai_log_anomaly")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = PROJECT_ROOT / "isolation_forest.joblib"
+TEMPLATES_PATH = PROJECT_ROOT / "templates.csv"
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+COPY_CHUNK_BYTES = 1024 * 1024
+logger = logging.getLogger("sentinellog")
 
-app = FastAPI(title="AI Log Anomaly Detection API", version="2.0.0")
+
+class RequestBodyTooLarge(Exception):
+    pass
+
+
+class UploadSizeLimitMiddleware:
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/predict"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        bytes_received = 0
+        response_started = False
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal bytes_received
+            message = await receive()
+            if message["type"] == "http.request":
+                bytes_received += len(message.get("body", b""))
+                if bytes_received > self.max_bytes:
+                    raise RequestBodyTooLarge
+            return message
+
+        async def tracked_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except RequestBodyTooLarge:
+            if not response_started:
+                body = b'{"detail":"Request exceeds the 200 MB upload limit."}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode("ascii")),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+
+
+app = FastAPI(title="SentinelLog AI Engine", version="1.0.0")
+app.add_middleware(
+    UploadSizeLimitMiddleware,
+    max_bytes=MAX_UPLOAD_BYTES + 64 * 1024,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-THREAT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("SQL Injection", ("union select", "or 1=1", "drop table", "information_schema", "select * from", "sqlmap")),
-    ("Brute Force Login", ("failed password", "authentication failure", "invalid user", "login failed", "too many attempts")),
-    ("Server Error", ("status=500", "http 500", "internal server error", "traceback", "exception", "error")),
-    ("Suspicious Command", ("cmd.exe", "powershell", "/bin/sh", "wget ", "curl ", "base64")),
-)
 
-
+@lru_cache(maxsize=1)
 def load_model_artifact() -> dict[str, Any]:
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
-    artifact = joblib.load(MODEL_PATH)
-    if not isinstance(artifact, dict) or "model" not in artifact or "feature_cols" not in artifact:
-        raise ValueError("Model artifact must contain 'model' and 'feature_cols'.")
-    if not isinstance(artifact["feature_cols"], list) or not artifact["feature_cols"]:
-        raise ValueError("Model artifact contains no feature columns.")
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(f"Model artifact not found: {MODEL_PATH}")
+    try:
+        artifact = joblib.load(MODEL_PATH)
+    except Exception as exc:
+        logger.exception("Could not load model artifact at %s", MODEL_PATH)
+        raise ValueError(f"Model artifact could not be loaded: {exc}") from exc
+    if (
+        not isinstance(artifact, dict)
+        or "model" not in artifact
+        or not isinstance(artifact.get("feature_cols"), list)
+        or not artifact["feature_cols"]
+    ):
+        raise ValueError("Model artifact must include a model and non-empty feature_cols.")
+    if not callable(getattr(artifact["model"], "predict", None)) or not callable(
+        getattr(artifact["model"], "decision_function", None)
+    ):
+        raise ValueError("Model must provide predict() and decision_function().")
     return artifact
 
 
-def classify_threat(lines: list[str]) -> str:
-    text = "\n".join(lines).lower()
-    for threat, indicators in THREAT_RULES:
-        if any(indicator in text for indicator in indicators):
-            return threat
-    return "Unclassified Anomaly"
+def _safe_filename(filename: str | None) -> str:
+    return (filename or "uploaded.log").replace("\\", "/").rsplit("/", 1)[-1] or "uploaded.log"
 
 
-def extract_block_from_line(line: str) -> str | None:
-    match = re.search(r"\bblk_-?\d+\b", line)
-    return match.group(0) if match else None
+async def _write_upload(upload: UploadFile, destination: Path) -> int:
+    total = 0
+    try:
+        with destination.open("wb") as target:
+            while chunk := await upload.read(COPY_CHUNK_BYTES):
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Log input exceeds the 200 MB upload limit.",
+                    )
+                target.write(chunk)
+    except OSError as exc:
+        logger.exception("Could not spool uploaded log to temporary storage")
+        raise HTTPException(status_code=507, detail="Temporary storage is unavailable.") from exc
+    return total
 
 
-def build_threat_lookup(raw_text: str) -> dict[str, str]:
-    grouped: defaultdict[str, list[str]] = defaultdict(list)
-    for line in raw_text.splitlines():
-        block_id = extract_block_from_line(line)
-        if block_id:
-            grouped[block_id].append(line)
-    return {block_id: classify_threat(lines) for block_id, lines in grouped.items()}
-
-
-def compute_risk(avg_score: float, anomaly_rate: float) -> tuple[str, float]:
-    risk_index = max(0.0, avg_score + (anomaly_rate * 3.0))
-    if risk_index >= 2.0:
-        return "Critical", risk_index
-    if risk_index >= 1.3:
-        return "High", risk_index
-    if risk_index >= 0.7:
-        return "Medium", risk_index
-    return "Low", risk_index
-
-
-def trigger_security_alert(risk_level: str, filename: str, anomalies: int) -> dict[str, Any]:
-    """Replace this integration point with SMTP, Telegram, or an incident API."""
-    triggered = risk_level in {"High", "Critical"} and anomalies > 0
-    if triggered:
-        logger.warning("Security alert triggered: file=%s risk=%s anomalies=%d", filename, risk_level, anomalies)
-    return {"triggered": triggered, "channels": ["email", "telegram"] if triggered else []}
+async def _write_raw_request(request: Request, destination: Path) -> int:
+    total = 0
+    try:
+        with destination.open("wb") as target:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Log input exceeds the 200 MB upload limit.",
+                    )
+                target.write(chunk)
+    except OSError as exc:
+        logger.exception("Could not spool raw request to temporary storage")
+        raise HTTPException(status_code=507, detail="Temporary storage is unavailable.") from exc
+    except ClientDisconnect as exc:
+        raise HTTPException(status_code=400, detail="The upload ended before the request completed.") from exc
+    return total
 
 
 @app.get("/")
-def read_root() -> dict[str, Any]:
-    try:
-        load_model_artifact()
-    except (FileNotFoundError, ValueError, OSError) as exc:
-        return {"status": "degraded", "model_loaded": False, "error": str(exc)}
-    return {"status": "online", "model_loaded": True, "model_name": MODEL_PATH.name}
+def read_root() -> dict[str, str]:
+    return {"status": "online", "engine": "SentinelLog AI", "version": "1.0.0"}
 
 
 @app.get("/health")
 def health_check() -> dict[str, Any]:
     try:
         load_model_artifact()
-    except (FileNotFoundError, ValueError, OSError) as exc:
+    except Exception as exc:
+        logger.exception("Health check could not load model")
         return {"status": "degraded", "model_loaded": False, "error": str(exc)}
     return {"status": "healthy", "model_loaded": True}
 
 
 @app.post("/predict")
-async def predict_logs(file: UploadFile = File(...)) -> dict[str, Any]:
-    filename = Path(file.filename or "").name
-    if not filename or Path(filename).suffix.lower() not in SUPPORTED_SUFFIXES:
-        raise HTTPException(status_code=400, detail="Only .log and .txt files are supported.")
+async def predict_logs(request: Request) -> dict[str, Any]:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            request_size = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.") from exc
+        if request_size > MAX_UPLOAD_BYTES + 64 * 1024:
+            raise HTTPException(status_code=413, detail="Log input exceeds the 200 MB upload limit.")
 
     try:
         artifact = load_model_artifact()
     except (FileNotFoundError, ValueError, OSError) as exc:
-        raise HTTPException(status_code=500, detail=f"Model is unavailable: {exc}") from exc
+        logger.exception("Prediction model is unavailable")
+        raise HTTPException(status_code=503, detail=f"Prediction model unavailable: {exc}") from exc
 
-    raw_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(raw_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Uploaded file exceeds the 10 MB limit.")
-    if not raw_bytes.strip():
-        raise HTTPException(status_code=400, detail="Uploaded log file is empty.")
-    raw_text = raw_bytes.decode("utf-8", errors="replace")
+    content_type = request.headers.get("content-type", "").lower()
+    with tempfile.TemporaryDirectory(prefix="sentinellog_") as temporary_directory:
+        raw_path = Path(temporary_directory) / "uploaded.log"
+        filename = "uploaded.log"
+        if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            try:
+                form = await request.form(
+                    max_files=1,
+                    max_fields=1,
+                    max_part_size=MAX_UPLOAD_BYTES,
+                )
+            except (MultiPartException, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid upload form: {exc}") from exc
+            uploaded = form.get("file")
+            if isinstance(uploaded, UploadFile):
+                filename = _safe_filename(uploaded.filename)
+                if Path(filename).suffix.lower() not in {".log", ".txt"}:
+                    await uploaded.close()
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Upload a .log or .txt text file.",
+                    )
+                try:
+                    uploaded_bytes = await _write_upload(uploaded, raw_path)
+                finally:
+                    await uploaded.close()
+            else:
+                text = form.get("text")
+                if not isinstance(text, str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Provide a .log/.txt file or a text form field.",
+                    )
+                encoded = text.encode("utf-8")
+                if len(encoded) > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Log input exceeds the 200 MB upload limit.",
+                    )
+                raw_path.write_bytes(encoded)
+                uploaded_bytes = len(encoded)
+        else:
+            uploaded_bytes = await _write_raw_request(request, raw_path)
 
-    with tempfile.TemporaryDirectory(prefix="logscan_", dir=str(TEMP_DIR)) as tmp_dir_name:
-        tmp_dir = Path(tmp_dir_name)
-        raw_path = tmp_dir / f"{uuid.uuid4().hex}_{filename}"
-        parsed_path = tmp_dir / "parsed_logs.csv"
-        template_path = tmp_dir / "templates.csv"
-        labels_path = tmp_dir / "labels.csv"
-        raw_path.write_text(raw_text, encoding="utf-8")
+        if uploaded_bytes == 0:
+            raise HTTPException(status_code=400, detail="Log input is empty.")
+        if not raw_path.is_file():
+            raise HTTPException(status_code=400, detail="No log content was uploaded.")
 
         try:
-            parse_log_file(str(raw_path), str(parsed_path), str(template_path))
-            parsed_df = pd.read_csv(parsed_path)
-        except (OSError, UnicodeError, pd.errors.ParserError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to parse uploaded log file: {exc}") from exc
-        if parsed_df.empty:
-            raise HTTPException(status_code=400, detail="No parseable log entries were found.")
+            result = await run_in_threadpool(
+                analyze_log_path,
+                raw_path,
+                artifact,
+                TEMPLATES_PATH,
+            )
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+            logger.info("Log analysis rejected for %s: %s", filename, exc)
+            raise HTTPException(status_code=400, detail=f"Could not analyze uploaded log: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Unexpected inference failure for %s", filename)
+            raise HTTPException(status_code=500, detail="Log inference failed unexpectedly.") from exc
 
-        block_ids = sorted(parsed_df["block_id"].astype(str).unique().tolist())
-        pd.DataFrame({"block_id": block_ids, "label": 0}).to_csv(labels_path, index=False)
-        try:
-            feature_df = build_feature_matrix(str(parsed_path), str(labels_path))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise HTTPException(status_code=500, detail=f"Feature extraction failed: {exc}") from exc
-
-        feature_cols = artifact["feature_cols"]
-        missing_cols = [column for column in feature_cols if column not in feature_df.columns]
-        if missing_cols:
-            raise HTTPException(status_code=500, detail=f"Model features mismatch: missing columns {missing_cols}.")
-
-        model = artifact["model"]
-        X = feature_df[feature_cols].fillna(0)
-        try:
-            decision_scores = -model.decision_function(X)
-            predictions = (model.predict(X) == -1).astype(int)
-        except (ValueError, TypeError, AttributeError) as exc:
-            raise HTTPException(status_code=500, detail=f"Model inference failed: {exc}") from exc
-
-        threat_lookup = build_threat_lookup(raw_text)
-        results_df = pd.DataFrame(
-            {
-                "block_id": feature_df["block_id"].astype(str),
-                "anomaly_score": decision_scores,
-                "predicted_anomaly": predictions,
-            }
-        )
-        results_df["threat_type"] = results_df["block_id"].map(threat_lookup).fillna("Unclassified Anomaly")
-        flagged = results_df[results_df["predicted_anomaly"] == 1].sort_values("anomaly_score", ascending=False)
-        anomaly_count = int(len(flagged))
-        anomaly_rate = float(predictions.mean()) if len(predictions) else 0.0
-        average_score = float(decision_scores.mean()) if len(decision_scores) else 0.0
-        max_score = float(decision_scores.max()) if len(decision_scores) else 0.0
-        risk_level, risk_index = compute_risk(average_score, anomaly_rate)
-        alert = trigger_security_alert(risk_level, filename, anomaly_count)
-
-        flagged_sessions = [
-            {
-                "block_id": str(row.block_id),
-                "anomaly_score": round(float(row.anomaly_score), 6),
-                "predicted_anomaly": int(row.predicted_anomaly),
-                "threat_type": str(row.threat_type),
-            }
-            for row in flagged.head(50).itertuples(index=False)
-        ]
-        return {
-            "status": "success",
-            "filename": filename,
-            "model_used": MODEL_PATH.name,
-            "scanned_lines": int(len(parsed_df)),
-            "sessions_analyzed": int(feature_df["block_id"].nunique()),
-            "anomalies_detected": anomaly_count,
-            "anomaly_rate": round(anomaly_rate, 4),
-            "average_anomaly_score": round(average_score, 6),
-            "max_anomaly_score": round(max_score, 6),
-            "risk_score": risk_level,
-            "risk_index": round(risk_index, 4),
-            "alert": alert,
-            "threat_summary": dict(Counter(item["threat_type"] for item in flagged_sessions)),
-            "flagged_sessions": flagged_sessions,
-            "parsed_logs": parsed_df.astype(str).to_dict(orient="records"),
-            "feature_columns": feature_cols,
-        }
+    result["filename"] = filename
+    result["model_used"] = MODEL_PATH.name
+    return result

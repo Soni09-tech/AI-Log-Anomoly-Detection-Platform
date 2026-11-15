@@ -54,6 +54,55 @@ def build_feature_matrix(parsed_csv, labels_csv, n_event_types=None):
     return feat_df
 
 
+def build_inference_feature_matrix(
+    parsed_csv,
+    labels_csv,
+    parsed_templates_csv,
+    known_templates_csv,
+    feature_cols,
+):
+    """Build model features using the template IDs and column order from training."""
+    parsed_df = pd.read_csv(parsed_csv)
+    parsed_templates = pd.read_csv(parsed_templates_csv)
+    known_templates = pd.read_csv(known_templates_csv)
+    required = {"event_id", "template"}
+    if not required.issubset(parsed_templates.columns) or not required.issubset(known_templates.columns):
+        raise ValueError("Template files must contain event_id and template columns.")
+
+    template_to_id = {
+        str(row.template): int(row.event_id)
+        for row in known_templates.itertuples(index=False)
+    }
+    next_unknown_id = max(template_to_id.values(), default=-1) + 1
+    unknown_ids = {}
+    incoming_ids = {
+        int(row.event_id): str(row.template)
+        for row in parsed_templates.itertuples(index=False)
+    }
+
+    def training_event_id(event_id):
+        nonlocal next_unknown_id
+        template = incoming_ids.get(int(event_id))
+        if template is None:
+            raise ValueError(f"No template found for parsed event ID {event_id}.")
+        if template in template_to_id:
+            return template_to_id[template]
+        if template not in unknown_ids:
+            unknown_ids[template] = next_unknown_id
+            next_unknown_id += 1
+        return unknown_ids[template]
+
+    parsed_df["event_id"] = parsed_df["event_id"].map(training_event_id)
+    parsed_df.to_csv(parsed_csv, index=False)
+    feature_df = build_feature_matrix(parsed_csv, labels_csv)
+
+    for column in feature_cols:
+        if column not in feature_df.columns:
+            feature_df[column] = 0
+    model_feature_cols = [column for column in feature_cols if column != "block_id"]
+    return feature_df[["block_id", *model_feature_cols]].fillna(0)
+
+
 def chronological_split(feat_df, test_frac=0.2):
     """
     Splits by block_id order of first appearance (proxy for time), NOT
